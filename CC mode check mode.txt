@@ -1,0 +1,182 @@
+	           //U[n]=Ki*Ts*E[n]-Kp*E[n-1]+Kp*E[n]+U[n-1]=E[n]*(Ki*Ts+Kp)-Kp*E[n-1]+U[n-1]
+	if(Comp_Out > upper)
+	{
+		Comp_Out = upper;
+	}
+	else if(Comp_Out < lower)
+	{
+		Comp_Out = lower;
+	}
+
+	PI_Last_X = Err;//E[n-1]
+	PI_Last_Y = Comp_Out;//U[n-1]
+
+			case CHARGE_CV_MODE:
+				//if((iL - icmd) > CHARGE_CV_TO_CC_DELTA_I)
+	    		if ((GetVbat_Inst() < (ChargeCCtoCV_Volt - 1.5)) && (GetVout4MA_Inst () < (ChargeCCtoCV_Volt - 1.5)))
+	    		{
+	    			CVmodetoCCmodeCnt++;
+	    		    if(CVmodetoCCmodeCnt >= 1000)//1s
+	    		    {
+	    		    	_CurrComplete = 1;
+					    PowerCtrlInfo.CtrlMode = CHARGE_CC_MODE;
+						PowerCtrlInfo.UpdateCnt++;
+
+						buf[0] = 0;
+						PackageDataToSendByCAN(0x92, 1, 'R', buf);
+	    		    }
+	    			else
+	    			{
+	    				CVmodetoCCmodeCnt = 0;
+	    			}
+	    	    }
+
+				break;
+
+			case CHARGE_CC_MODE:
+
+					if (_CurrComplete == 1)
+					{
+						static int StepWaitCnt = 0; /// 0 - 5 - 10 - 15
+
+						iL = GetSysIL();
+						icmd = GetCommBatCtrlIcmd();
+	//#if 1
+						/// B.Icmd  - P.Icmd - Cnt
+						/// 20/15/9   9        0
+						/// 20        15       5
+						/// 20        20       10
+						/// 15        9        0
+						/// 15        15       5
+
+						if (icmd > 15)
+						{
+							if (StepWaitCnt == 0)
+							{
+								PowerCtrlInfo.Icmd = 9;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+							else if ((StepWaitCnt >= 150) && (fabs(iL - PowerCtrlInfo.Icmd) < 1.0) && (PowerCtrlInfo.Icmd == 9))
+							{
+								PowerCtrlInfo.Icmd = 15;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+							else if ((StepWaitCnt >= 300) && (fabs(iL - PowerCtrlInfo.Icmd) < 1.0) && (PowerCtrlInfo.Icmd == 15))
+							{
+								PowerCtrlInfo.Icmd = icmd;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+						}
+						else if ((icmd <= 15) && (icmd > 9))
+						{
+							if (StepWaitCnt == 0)
+							{
+								PowerCtrlInfo.Icmd = 9;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+							else if ((StepWaitCnt >= 150) && (fabs(iL - PowerCtrlInfo.Icmd) < 1.0) && (PowerCtrlInfo.Icmd == 9))
+							{
+								PowerCtrlInfo.Icmd = icmd;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+						}
+
+						StepWaitCnt++;
+
+						if (fabs(iL - icmd) < 1.0)
+						{
+							PowerCtrlInfo.Icmd = GetCommBatCtrlIcmd();
+							PowerCtrlInfo.UpdateCnt++;
+
+							_CurrComplete = 0;
+							StepWaitCnt = 0;
+						}
+					}
+					else
+					{
+						if ((GetVbat_Inst() > (ChargeCCtoCV_Volt-5)) && (GetVout4MA_Inst () > (ChargeCCtoCV_Volt-5)))
+						{
+							if(PowerCtrlInfo.Icmd < 7)
+							{
+								PowerCtrlInfo.CtrlMode = CHARGE_CV_MODE;
+								//PowerCtrlInfo.Checkmode = Checkmode ;
+								PowerCtrlInfo.UpdateCnt++;
+								CVmodetoCCmodeCnt = 0;
+								//Checkmode = 0;
+								//CheckmodeCnt = 0;
+								//CmdUpdate = 0;
+
+								if(AlertRecoverRampIcmdInfo.RampEn)
+									ForceIcmdRampStop();
+
+								buf[0] = 0;
+								PackageDataToSendByCAN(0x91, 1, 'R', buf);
+								//Checkmode = 1;//return to check mode
+								//CmdUpdate = 1;
+							}
+							else
+							{
+								PowerCtrlInfo.Icmd = PowerCtrlInfo.Icmd - 1;
+								PowerCtrlInfo.UpdateCnt++;
+							}
+						}
+						else
+						{
+							/// do nothing.
+						}
+					}
+
+//					if(Checkmode == 1)
+//					{
+//						if(CmdUpdate == 1)
+//						{
+//	    				icmd = 1.5;
+//	    				PowerCtrlInfo.Icmd = icmd;
+//	    				PowerCtrlInfo.UpdateCnt++;
+//	    				//CmdUpdate = 0;
+//	    				CheckmodeCnt ++;
+//						}
+//
+//						if (CheckmodeCnt > 1000)// 120000/2min ; 600000/5min
+//						{
+//							if (GetVbat_Inst() < (ChargeCCtoCV_Volt - 1))//LowSoc
+//							{
+//	    					//_CurrComplete = 1;
+//							icmd = 9;//GetCommBatCtrlIcmd();
+//							PowerCtrlInfo.Icmd = icmd ;//GetCommBatCtrlIcmd();
+//							PowerCtrlInfo.UpdateCnt++;
+//							Checkmode = 0;
+//							CheckmodeCnt = 0;
+//							CmdUpdate = 0;
+//							_CurrComplete = 1;
+//
+//							/*if(GetVbat_Inst() > (ChargeCCtoCV_Volt - 2))//avoid setting high current in high Soc
+//							{
+//								CHARGE_CC_High_Soc_FIXED_ICMD = 1 ;
+//							}
+//							else
+//							{
+//								CHARGE_CC_High_Soc_FIXED_ICMD = 0 ;
+//							}*/
+//
+//
+//							}
+//	       			    else //if((GetVbat_Inst() < (ChargeCCtoCV_Volt - 1)))//highSoc
+//	    			    	{
+//	       			    	PowerCtrlInfo.CtrlMode = CHARGE_CV_MODE;
+//							//PowerCtrlInfo.Checkmode = Checkmode ;
+//							PowerCtrlInfo.UpdateCnt++;
+//							CVmodetoCCmodeCnt = 0;
+//							Checkmode = 0;
+//						    CheckmodeCnt = 0;
+//						    CmdUpdate = 0;
+//
+//							if(AlertRecoverRampIcmdInfo.RampEn)
+//								ForceIcmdRampStop();
+//
+//							buf[0] = 0;
+//							PackageDataToSendByCAN(0x91, 1, 'R', buf);
+//	    			    	}
+//
+//						}
+//					}

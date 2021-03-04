@@ -31,7 +31,7 @@
 #define SR_SW_OFF	0
 #define SR_SW_ON	1
 
-#define ICMD_RAMP_TIMEOUT 			100						//100 * 10us = 1ms
+#define ICMD_RAMP_TIMEOUT 			200						//100 * 10us = 1ms
 #define FF_CHANGE_VALUE_TIME		((long)100000)
 
 #define WAIT_STABLE_TIME			5000					//50ms
