@@ -1,0 +1,838 @@
+#include "DSP28x_Project.h"
+#include "CLAShared.h"
+#include "SystemDefine.h"
+#include "PwmDrv.h"
+#include "Meas.h"
+#include "PowerCtrl.h"
+
+
+/*****************************************************************************/
+/* Definitions                                                               */
+/*****************************************************************************/
+#define CTRL_LAW_VOLT_SCALE					0.01
+#define CTRL_LAW_CMD_SCALE					0.01
+
+#define DISCHARGE_VCMD_SCALE 				(CTRL_LAW_VOLT_SCALE * VIN_SCALE)
+
+#define COMP_PARA_PI_COEFF_A_CHARGE_CV_MODE		(0.215)		//(0.00103*10)//(0.00103*0.1)//
+#define COMP_PARA_PI_COEFF_B_CHARGE_CV_MODE		(-0.185)	//(-0.00097*10)//(-0.00097*0.1)//
+#define COMP_PARA_PI_COEFF_A_CHARGE_CC_MODE		(0.01001)	//(0.00101)
+#define COMP_PARA_PI_COEFF_B_CHARGE_CC_MODE		(-0.00999)	//(-0.00099)
+#define COMP_PARA_PI_COEFF_A_DISCHARGE_CC_MODE	(0.00101)	//(0.0824)
+#define COMP_PARA_PI_COEFF_B_DISCHARGE_CC_MODE	(-0.00099)	//(-0.0776)
+
+#define DISCHARGE_AMPLITUDE_PI_COEFF_A			(6.0006)
+#define DISCHARGE_AMPLITUDE_PI_COEFF_B			(-5.9994)
+
+#define FILTER_DISCHARGE_COEF_A					(0.029126214)
+#define FILTER_DISCHARGE_COEF_B					(0.941747573)
+
+
+#define SR_SW_OFF	0
+#define SR_SW_ON	1
+
+#define ICMD_RAMP_TIMEOUT 			100						//100 * 10us = 1ms
+#define FF_CHANGE_VALUE_TIME		((long)100000)
+
+#define WAIT_STABLE_TIME			5000					//50ms
+
+enum CTRLLAW_STATE{
+	CTRLLAW_STOP = 0,
+	CTRLLAW_START,
+	CTRLLAW_CONTROL,
+	CTRLLAW_RAMP_TO_DISABLE,
+	CTRLLAW_DELAY
+};
+
+enum FF_CTRL_STATE{
+	FF_STATE_FIRST_RAMP = 0,
+	FF_STATE_WAIT_FIRST_RAMP_FINISH,
+	FF_STATE_SECOND_RAMP,
+	FF_STATE_WAIT_RAMP_FINISH,
+	FF_STATE_RAMP_FINISH,
+	FF_STATE_WAIT_CHANGE,
+	FF_STATE_CHANGE_VALUE,
+	FF_STATE_CV_MODE_CTRL
+};
+
+enum FF_CTRL_MODE{
+	FF_CTRL_STOP = 0,
+	FF_CTRL_RAMP,
+	FF_CTRL_CHANGE_VAL,
+	FF_CTRL_CV_MODE,
+	FF_CTRL_DISCHARGE_MODE
+};
+
+enum FF_RAMP_EN_TYPE
+{
+	FF_RAMP_EN_STOP = 0,
+	FF_RAMP_EN_FIRST_TIME,
+	FF_RAMP_EN_SECOND_TIME,
+	FF_RAMP_EN_CHANGE_VAL
+};
+
+/*****************************************************************************/
+/* Data                                                                      */
+/*****************************************************************************/
+#pragma DATA_SECTION(Cla_CtrlLawState, "Cla1ToCpuMsgRAM");
+long Cla_CtrlLawState;
+
+#pragma DATA_SECTION(Cla_RampToDisableFinish, "Cla1ToCpuMsgRAM");
+long Cla_RampToDisableFinish;
+
+long CtrlLawState;
+long CtrlMode, LastOutputCtrlMode;
+float Err;
+float PI_Last_X;
+float PI_Last_Y;
+float Comp_Out;
+float Feed_Out;
+float OutputDuty;
+
+float Feedback1;
+float Feedback2;
+float Feedback3;
+
+float Discharge_Amplitude;
+float Discharge_Verr;
+float Discharge_PI_Output;
+float Discharge_PI_Last_X;
+float Discharge_PI_Last_Y;
+
+long SR_SW_Status;
+long DelayOutputCnt;
+
+COMPENSATOR_PARA ChargeCV_CompPara;
+COMPENSATOR_PARA ChargeCC_CompPara;
+COMPENSATOR_PARA DisChargeCC_CompPara;
+COMPENSATOR_PARA CompPara;
+
+FILTERPARA DischargeFilterPara;
+
+
+float Vcmd;
+float Icmd;
+float IcmdTarget;
+RAMP_INFO RampIcmdInfo;
+
+long FF_Ctrl_Ramp_State;
+long FF_Ctrl_Normal_State;
+long FF_Change_Val_Time;
+RAMP_INFO RampFFInfo;
+
+long Setup_FF_Ramp_Info_Flag;
+
+long DischargeOverVcmdFlag;
+
+long TestDischargeStart;
+
+float DutyRampQuant;
+long KeepTimeBeforeDisable;
+
+float DischargeStopVolt;
+
+float VoltageRatio;
+
+long CtrlLawRampCnt;
+
+
+/*****************************************************************************/
+/* Function Prototypes                                                       */
+/*****************************************************************************/
+#define Setup_FF_Ramp_Info()				RampFFInfo.RampTarget = Feedback2 / Feedback3;\
+											if(RampFFInfo.RampTarget >= Feed_Out)\
+											{\
+												RampFFInfo.RampDir = 1;\
+												RampFFInfo.RampQuant = 0.01;\
+											}\
+											else\
+											{\
+												RampFFInfo.RampDir = 2;\
+												RampFFInfo.RampQuant = -0.01;\
+											}\
+											RampFFInfo.RampVal = Feed_Out
+
+
+float Filter(float input, FILTERPARA *filterPara)
+{
+	float output;
+
+	output = filterPara->Coef_A * (input + filterPara->LastInput) + filterPara->Coef_B * filterPara->LastOutput;
+	filterPara->LastInput = input;
+	filterPara->LastOutput = output;
+
+	return output;
+}
+
+void BoostDrv(float duty, long sr_sw_act) //cost about 720ns
+{
+	float a,b;
+
+
+	SW_A.AQCSFRC.all = 1;		//Forces a continuous low
+	SW_B.AQCSFRC.all = 1;		//Forces a continuous low
+	SW_C.AQCSFRC.all = 1;		//Forces a continuous low
+	SW_D.AQCSFRC.all = 1;		//Forces a continuous low
+
+	if(duty < 0.2)
+	{
+		SW_E.AQCSFRC.all = 1;		//Forces a continuous low
+		SW_F.AQCSFRC.all = 1;		//Forces a continuous low
+	}
+	else
+	{
+		a = SWITCH_PERIOD_200K * duty * 65536;
+		b = (SWITCH_PERIOD_200K * (1 + duty)) * 65536;
+
+		SW_A.CMPA.all = a;
+		SW_B.CMPA.all = b;
+		SW_C.CMPA.all = b;
+		SW_D.CMPA.all = a;
+		SW_E.CMPA.all = a;
+		SW_F.CMPA.all = b;
+
+		SW_E.AQCSFRC.all = 0;		//Disable force
+		SW_F.AQCSFRC.all = 0;		//Disable force
+	}
+}
+
+void PSFBDrv(float duty, long sr_sw_act)
+{
+	float a, b, c, d;
+
+	if(duty < 0.1)
+	{
+		duty = 0;
+	}
+
+	a = SWITCH_PERIOD_200K * duty;
+	b = (2 - duty)*SWITCH_PERIOD_200K + 1;								//b = SWITCH_PERIOD_200K + (1 - duty)*SWITCH_PERIOD_200K + 1;
+										  	  	  	  	  	  	  	  	//  = 900 - a + 1
+	c = a + PSFB_SR_DB_RED + PSFB_SR_EXT_DB2;							//include SW_E Rising edge dead time
+	d = (SWITCH_PERIOD_200K) - a - PSFB_SR_DB_FED - PSFB_SR_EXT_DB2;	//include SW_F Rising edge dead time
+
+	if(b > PSFB_SWITCH_PERIOD)
+	{
+		b = PSFB_SWITCH_PERIOD;
+	}
+	b *= 65536;
+
+	SW_C.TBPHS.all = b;
+	SW_D.TBPHS.all = b;
+
+	if((duty < 0.1) || (sr_sw_act == SR_SW_OFF))
+	{
+		SW_E.AQCSFRC.all = 1;		//Forces a continuous low
+		SW_F.AQCSFRC.all = 1;		//Forces a continuous low
+	}
+	else
+	{
+		SW_E.CMPA.all = c * 65536;
+		SW_F.CMPA.all = d * 65536;
+		SW_E.AQCSFRC.all = 0;		//Disable force
+		SW_F.AQCSFRC.all = 0;		//Disable force
+	}
+
+	if(duty >= 0.1)
+	{
+		SW_A.AQCSFRC.all = 0;		//Disable force
+		SW_B.AQCSFRC.all = 0;		//Disable force
+		SW_C.AQCSFRC.all = 0;		//Disable force
+		SW_D.AQCSFRC.all = 0;		//Disable force
+	}
+	else
+	{
+		SW_A.AQCSFRC.all = 1;
+		SW_B.AQCSFRC.all = 1;
+		SW_C.AQCSFRC.all = 1;
+		SW_D.AQCSFRC.all = 1;
+	}
+}
+
+void ClearPwmPhaseReg()
+{
+	SW_A.TBPHS.all = 0;
+	SW_B.TBPHS.all = 0;
+	SW_C.TBPHS.all = 0;
+	SW_D.TBPHS.all = 0;
+	SW_E.TBPHS.all = 0;
+	SW_F.TBPHS.all = 0;
+}
+
+void Compensator(float upper, float lower)
+{
+	Comp_Out = CompPara.PI_Coeff_A * Err + CompPara.PI_Coeff_B * PI_Last_X + PI_Last_Y;		//PI Controller
+
+	if(Comp_Out > upper)
+	{
+		Comp_Out = upper;
+	}
+	else if(Comp_Out < lower)
+	{
+		Comp_Out = lower;
+	}
+
+	PI_Last_X = Err;
+	PI_Last_Y = Comp_Out;
+
+	Comp_Out /= Feedback3;
+}
+
+void Discharge_Amplitude_PI()
+{
+	float amplitude_high;
+
+	Discharge_PI_Output = DISCHARGE_AMPLITUDE_PI_COEFF_A * Discharge_Verr + DISCHARGE_AMPLITUDE_PI_COEFF_B * Discharge_PI_Last_X + Discharge_PI_Last_Y;
+
+	amplitude_high = CtrlLawInput.Discharge_I_Lmt;
+
+	if(Discharge_PI_Output > amplitude_high)
+	{
+		Discharge_PI_Output = amplitude_high;
+	}
+	else if(Discharge_PI_Output < DISCHARGE_AMPLITUDE_LMT_LOW)
+	{
+		Discharge_PI_Output = DISCHARGE_AMPLITUDE_LMT_LOW;
+	}
+
+	Discharge_PI_Last_X = Discharge_Verr;
+	Discharge_PI_Last_Y = Discharge_PI_Output;
+}
+
+void FeedForward(long act)
+{
+	switch(act)
+	{
+		case FF_CTRL_STOP:
+			FF_Ctrl_Ramp_State = FF_STATE_FIRST_RAMP;
+			FF_Change_Val_Time = FF_CHANGE_VALUE_TIME;					//100000
+			FF_Ctrl_Normal_State = FF_STATE_WAIT_CHANGE;
+			break;
+
+		case FF_CTRL_RAMP:
+			switch(FF_Ctrl_Ramp_State)
+			{
+				case FF_STATE_FIRST_RAMP:
+					RampFFInfo.RampEn = FF_RAMP_EN_FIRST_TIME;
+
+					Setup_FF_Ramp_Info_Flag = 1;
+
+					FF_Ctrl_Ramp_State = FF_STATE_WAIT_FIRST_RAMP_FINISH;//FF_WAIT_RAMP_FINISH;
+					break;
+
+				case FF_STATE_WAIT_FIRST_RAMP_FINISH:
+					break;
+			}
+			break;
+
+		case FF_CTRL_CHANGE_VAL:
+			Feed_Out = CtrlLawInput.Vout_Avg / CtrlLawInput.Vin_Avg;
+			break;
+
+		case FF_CTRL_CV_MODE:
+			Feed_Out = Feedback2 / Feedback3;
+			break;
+
+		case FF_CTRL_DISCHARGE_MODE:
+			RampFFInfo.RampEn = FF_RAMP_EN_STOP;
+			VoltageRatio = CtrlLawInput.Vout_Avg / CtrlLawInput.Vin_Avg;
+			Feed_Out = 1 - VoltageRatio;
+			break;
+	}
+	//Perform when FF_RAMP_EN_FIRST_TIME
+	if(Setup_FF_Ramp_Info_Flag==1)
+	{
+		Setup_FF_Ramp_Info_Flag = 0;
+		Setup_FF_Ramp_Info();
+	}
+	
+	//Default : FF_RAMP_EN_STOP
+	if(RampFFInfo.RampEn != FF_RAMP_EN_STOP)
+	{
+		RampFFInfo.RampVal += RampFFInfo.RampQuant;
+		
+		if(RampFFInfo.RampDir == 1)
+		{
+			//Feedback2 / Feedback3 >= Feed_Out
+			if(RampFFInfo.RampVal >= RampFFInfo.RampTarget)
+			{
+				RampFFInfo.RampEn = FF_RAMP_EN_STOP;
+				Feed_Out = RampFFInfo.RampTarget;
+			}
+			else
+			{
+				Feed_Out = RampFFInfo.RampVal;
+			}
+		}
+		else
+		{
+			//Feedback2 / Feedback3 < Feed_Out
+			if(RampFFInfo.RampVal <= RampFFInfo.RampTarget)
+			{
+				RampFFInfo.RampEn = FF_RAMP_EN_STOP;
+				Feed_Out = RampFFInfo.RampTarget;
+			}
+			else
+			{
+				Feed_Out = RampFFInfo.RampVal;
+			}
+		}
+	}
+
+}
+
+void DutyLimit()
+{
+	if(OutputDuty > CtrlLawInput.DutyLmtMax)
+		OutputDuty = CtrlLawInput.DutyLmtMax;
+	else if(OutputDuty < CtrlLawInput.DutyLmtMin)
+		OutputDuty = CtrlLawInput.DutyLmtMin;
+}
+
+void SetupIcmdRamp(float target, float icmd)
+{
+	RampIcmdInfo.RampTarget = target;
+	RampIcmdInfo.RampQuant = 1;
+	RampIcmdInfo.RampTime = ICMD_RAMP_TIMEOUT;
+	if(RampIcmdInfo.RampTarget > icmd)
+	{
+		RampIcmdInfo.RampDir = 1;
+	}
+	else
+	{
+		RampIcmdInfo.RampDir = 2;
+	}
+	RampIcmdInfo.RampVal = icmd;		//從目前的Icmd開始Ramp
+}
+
+float IcmdRampFunc()
+{
+	RampIcmdInfo.RampTime++;
+
+	if(RampIcmdInfo.RampTime >= ICMD_RAMP_TIMEOUT)
+	{
+		RampIcmdInfo.RampTime = 0;
+
+		if(RampIcmdInfo.RampDir == 1)
+		{
+			RampIcmdInfo.RampVal += RampIcmdInfo.RampQuant;
+			if(RampIcmdInfo.RampVal >= RampIcmdInfo.RampTarget)
+			{
+				RampIcmdInfo.RampVal = RampIcmdInfo.RampTarget;
+				RampIcmdInfo.RampEn = 0;
+			}
+		}
+		else
+		{
+			RampIcmdInfo.RampVal -= RampIcmdInfo.RampQuant;
+			if(RampIcmdInfo.RampVal <= RampIcmdInfo.RampTarget)
+			{
+				RampIcmdInfo.RampVal = RampIcmdInfo.RampTarget;
+				RampIcmdInfo.RampEn = 0;
+			}
+		}
+	}
+
+	return RampIcmdInfo.RampVal;
+}
+
+
+/*long CVModeRampEnable;
+float CVModeRampVolt;
+
+void SetCVModeVcmd(float vcmd, long rampEn)
+{
+	if(rampEn)
+	{
+		CVModeRampEnable = 1;
+		CVModeRampVolt = vcmd - 0.1;
+	}
+}
+
+float GetCVModeVcmd()
+{
+	if(CVModeRampEnable)
+	{
+
+	}
+}
+
+void SetCVModeRampEnable()
+{
+	CVModeRampEnable = 1;
+	CVModeRampVolt = vcmd - 0.1;
+}
+*/
+
+#define CVMODE_RAMP_PERIOD			50000		//500ms
+
+long CVModeRampEnable;
+long CVModeRampPeriod;
+float CVModeRampVal;
+
+void SetupCVModeRampEnable()
+{
+	CVModeRampEnable = 1;
+	CVModeRampVal = CtrlLawInput.Vcmd - 0.1;
+	CVModeRampPeriod = CVMODE_RAMP_PERIOD;
+}
+
+void DisableCVModeRamp()
+{
+	CVModeRampEnable = 0;
+}
+
+float GetCVModeRampVal()
+{
+	CVModeRampPeriod--;
+	if(CVModeRampPeriod==0)
+	{
+		CVModeRampPeriod = CVMODE_RAMP_PERIOD;
+		CVModeRampVal += 0.01;
+
+		if(CVModeRampVal >= CtrlLawInput.Vcmd)
+		{
+			CVModeRampVal = CtrlLawInput.Vcmd;
+			CVModeRampEnable = 0;
+		}
+	}
+
+	return CVModeRampVal;
+}
+
+__interrupt void Cla1Task3( void )
+{
+	if(CtrlMode != CtrlLawInput.CtrlMode)	//CtrlMode Change
+	{
+		if(CtrlMode != DISABLE_MODE)
+		{
+			LastOutputCtrlMode = CtrlMode;
+		}
+		CtrlMode = CtrlLawInput.CtrlMode;
+		PI_Last_X = 0;
+		PI_Last_Y = 0;
+
+		switch(CtrlMode)
+		{
+			case CHARGE_CV_MODE:
+				CompPara = ChargeCV_CompPara;
+				FeedForward(FF_CTRL_STOP);
+				FeedForward(FF_CTRL_CV_MODE);
+				IcmdTarget = 0;
+
+//				SetupCVModeRampEnable();
+
+				break;
+
+			case CHARGE_CC_MODE:
+				CompPara = ChargeCC_CompPara;
+				break;
+
+			case DISCHARGE_CC_MODE:
+				CompPara = DisChargeCC_CompPara;
+				ClearPwmPhaseReg();
+				break;
+		}
+	}
+
+	// << ControlLawState control >>
+	if(CtrlMode == DISCHARGE_CC_MODE)
+	{
+		DischargeStopVolt = CtrlLawInput.Vcmd+30;
+		if(DischargeStopVolt > 392)
+			DischargeStopVolt = 392;
+
+		if(CtrlLawInput.Vin >= ((DischargeStopVolt) * VIN_SCALE))
+		{
+			CtrlLawState = CTRLLAW_STOP;
+		}
+		else if(CtrlLawInput.RampDisableEn == 1)
+		{
+			CtrlLawState = CTRLLAW_RAMP_TO_DISABLE;
+		}
+		else if((CtrlLawInput.Vin < (CtrlLawInput.Vcmd * VIN_SCALE)) && (TestDischargeStart==0))	//CtrlLawInput.Vin = Vin * 0.2
+		{
+			TestDischargeStart = 1;
+			CtrlLawState = CTRLLAW_CONTROL;
+		}
+	}
+	else if(CtrlMode == DISABLE_MODE)
+	{
+		CtrlLawState = CTRLLAW_STOP;
+	}
+	else
+	{
+		if((CtrlLawInput.Vout * 1.2 > CtrlLawInput.Vin) || (CtrlLawInput.Vin < 4))
+		{
+			CtrlLawState = CTRLLAW_STOP;
+		}
+		else if((CtrlLawInput.VoutUVPDet==1) && ((CtrlLawInput.Vout < 12) || (CtrlLawInput.Vout * 4 < CtrlLawInput.Vin)))
+		{
+			CtrlLawState = CTRLLAW_STOP;
+		}
+		else if((CtrlLawInput.Icmd < 4.9) && (CtrlMode == CHARGE_CC_MODE))	//Test for Icmd=0A
+		{
+			CtrlLawState = CTRLLAW_STOP;
+		}
+		else
+		{
+			if(CtrlLawState == CTRLLAW_STOP)
+			{
+				CtrlLawState = CTRLLAW_START;
+			}
+		}
+	}
+
+	if(CtrlMode == CHARGE_CV_MODE)
+	{
+		Vcmd = CtrlLawInput.Vcmd;
+		/*if(CVModeRampEnable)
+			Vcmd = GetCVModeRampVal();
+		else
+			Vcmd = CtrlLawInput.Vcmd;*/
+
+		Feedback1 = CtrlLawInput.Vbat;
+		Feedback3 = CtrlLawInput.Vin_Avg;
+#ifdef FUNC_TEST
+		OutputDuty = CtrlLawInput.Vcmd;
+#endif
+	}
+	else if(CtrlMode == CHARGE_CC_MODE)
+	{
+		Feedback1 = CtrlLawInput.IL;
+		Feedback2 = CtrlLawInput.Vout * CTRL_LAW_VOLT_SCALE;
+		Feedback3 = CtrlLawInput.Vin * CTRL_LAW_VOLT_SCALE;
+#ifdef FUNC_TEST
+		OutputDuty = CtrlLawInput.Icmd;
+#endif
+	}
+	else if(CtrlMode == DISCHARGE_CC_MODE)
+	{
+		Vcmd = CtrlLawInput.Vcmd * DISCHARGE_VCMD_SCALE;
+		Feedback1 = CtrlLawInput.IL;
+		Feedback2 = (CtrlLawInput.Vin - CtrlLawInput.Vout) * CTRL_LAW_VOLT_SCALE;
+		Feedback3 = CtrlLawInput.Vin * CTRL_LAW_VOLT_SCALE;
+#ifdef FUNC_TEST
+		OutputDuty = CtrlLawInput.Icmd;
+#endif
+	}
+
+
+	switch(CtrlLawState)
+	{
+		case CTRLLAW_START:
+			if(DelayOutputCnt <= WAIT_STABLE_TIME) //wait for Vin stable
+			{
+				DelayOutputCnt++;
+				OutputDuty = 0;
+				CtrlLawRampCnt = 3;	//因為程式流程的關係，此處雖然是設3，但是實際上是做2次!!
+				Feed_Out = 0;
+			}
+			else
+			{
+				FeedForward(FF_CTRL_RAMP);
+				if(RampFFInfo.RampEn == FF_RAMP_EN_STOP)
+				{
+					CtrlLawRampCnt--;
+					if(CtrlLawRampCnt==0)
+					{
+						CtrlLawState = CTRLLAW_CONTROL;
+					}
+				}
+
+				OutputDuty = Feed_Out;
+			}
+			break;
+
+		case CTRLLAW_CONTROL:
+			if(CtrlMode == CHARGE_CC_MODE)
+			{
+				if(IcmdTarget != CtrlLawInput.Icmd)	//Icmd Change
+				{
+					IcmdTarget = CtrlLawInput.Icmd;
+					SetupIcmdRamp(IcmdTarget, Icmd);
+					RampIcmdInfo.RampEn = 1;
+				}
+
+				if(RampIcmdInfo.RampEn == 1)
+				{
+					Icmd = IcmdRampFunc();
+				}
+				else
+				{
+					Icmd = IcmdTarget;
+				}
+
+				Err = Icmd - Feedback1 ;
+				Compensator(0.2, -0.2);
+				FeedForward(FF_CTRL_CHANGE_VAL);
+			}
+			else if(CtrlMode == DISCHARGE_CC_MODE)
+			{
+				Discharge_Verr = Vcmd - Feedback3;
+				Discharge_Amplitude_PI();
+				Discharge_Amplitude = Filter(Discharge_PI_Output, &DischargeFilterPara);
+				//Discharge_Amplitude_Lmt();
+				Err = Discharge_Amplitude * 100 - Feedback1;
+				Compensator(0.2, -0.2);
+				FeedForward(FF_CTRL_DISCHARGE_MODE);
+
+				DutyRampQuant = (OutputDuty-0.2) / 1000;			//1000 => 10ms
+			}
+			else
+			{
+				Err = Vcmd - Feedback1 ;
+				Compensator(80, 0);
+				Feed_Out = 0;
+			}
+
+			OutputDuty = Feed_Out + Comp_Out;
+
+			break;
+
+		case CTRLLAW_STOP:
+			OutputDuty = 0;
+			DelayOutputCnt = 0;
+			IcmdTarget = 0;
+			Icmd = 0;
+
+			PI_Last_X = 0;
+			PI_Last_Y = 0;
+
+			Discharge_PI_Last_X = 0;
+			Discharge_PI_Last_Y = 0;
+
+			Cla_RampToDisableFinish = 0;
+			KeepTimeBeforeDisable = 200;
+
+			TestDischargeStart = 0;
+
+			FeedForward(FF_CTRL_STOP);
+
+//			DisableCVModeRamp();
+			break;
+
+		case CTRLLAW_RAMP_TO_DISABLE:
+			OutputDuty -= DutyRampQuant;
+			if(OutputDuty <= 0.2)
+			{
+				Cla_RampToDisableFinish = 1;
+				OutputDuty = 0;
+			}
+			break;
+	}
+
+	DutyLimit();
+
+	//Default: SR_SW_OFF
+	if(SR_SW_Status == SR_SW_OFF)
+	{
+		if(CtrlLawInput.IL >= 7)
+		{
+			SR_SW_Status = SR_SW_ON;
+		}
+	}
+	else
+	{
+		if(CtrlLawInput.IL <= 3)
+		{
+			SR_SW_Status = SR_SW_OFF;
+		}
+	}
+
+	if(CtrlMode == DISABLE_MODE)
+	{
+		if(LastOutputCtrlMode == DISCHARGE_CC_MODE)
+		{
+			SR_SW_Status = SR_SW_OFF;
+			BoostDrv(OutputDuty, SR_SW_Status);
+		}
+		else
+		{
+			PSFBDrv(OutputDuty, SR_SW_Status);
+		}
+	}
+	else if(CtrlMode == DISCHARGE_CC_MODE)
+	{
+		SR_SW_Status = SR_SW_OFF;
+		BoostDrv(OutputDuty, SR_SW_Status);
+	}
+	else
+	{
+		PSFBDrv(OutputDuty, SR_SW_Status);
+	}
+
+	Cla_CtrlLawState = CtrlLawState;
+}
+
+__interrupt void Cla1Task8( void )
+{
+	ClaTestToggle = 0;
+	ClaToCpuData = 0xFFFF;
+
+	CtrlLawState = FF_CTRL_STOP;
+	CtrlMode = DISABLE_MODE;
+	Err = 0;
+	PI_Last_X = 0;
+	PI_Last_Y = 0;
+
+	Comp_Out =0;
+	Feed_Out = 0;
+	OutputDuty = 0;
+	LastOutputCtrlMode = 0;
+
+	Discharge_Amplitude = 0;
+	Discharge_Verr = 0;
+	Discharge_PI_Last_X = 0;
+	Discharge_PI_Last_Y = 0;
+
+	ChargeCV_CompPara.PI_Coeff_A = COMP_PARA_PI_COEFF_A_CHARGE_CV_MODE;
+	ChargeCV_CompPara.PI_Coeff_B = COMP_PARA_PI_COEFF_B_CHARGE_CV_MODE;
+	ChargeCC_CompPara.PI_Coeff_A = COMP_PARA_PI_COEFF_A_CHARGE_CC_MODE;
+	ChargeCC_CompPara.PI_Coeff_B = COMP_PARA_PI_COEFF_B_CHARGE_CC_MODE;
+	DisChargeCC_CompPara.PI_Coeff_A = COMP_PARA_PI_COEFF_A_DISCHARGE_CC_MODE;
+	DisChargeCC_CompPara.PI_Coeff_B = COMP_PARA_PI_COEFF_B_DISCHARGE_CC_MODE;
+
+	DischargeFilterPara.Coef_A = FILTER_DISCHARGE_COEF_A;
+	DischargeFilterPara.Coef_B = FILTER_DISCHARGE_COEF_B;
+	DischargeFilterPara.LastInput = 0;
+	DischargeFilterPara.LastOutput = 0;
+
+	SR_SW_Status = SR_SW_OFF;
+	DelayOutputCnt = 0;
+
+	Vcmd = 0;
+	IcmdTarget = 0;
+	Icmd = 0;
+
+	RampIcmdInfo.RampEn = 0;
+	RampIcmdInfo.RampDir = 0;
+	RampIcmdInfo.RampTime = 0;
+	RampIcmdInfo.RampQuant = 0;
+	RampIcmdInfo.RampTarget = 0;
+	RampIcmdInfo.RampVal = 0;
+
+	RampFFInfo.RampEn = FF_RAMP_EN_STOP;
+	RampFFInfo.RampVal = 0.1;
+	RampFFInfo.RampQuant = 0.01;
+	RampFFInfo.RampTarget = 0;
+	RampFFInfo.RampTime = 0;
+	RampFFInfo.RampDir = 0;
+
+	Setup_FF_Ramp_Info_Flag = 0;
+
+	DischargeOverVcmdFlag = 0;
+
+	Cla_RampToDisableFinish = 0;
+
+	DutyRampQuant = 0;
+	KeepTimeBeforeDisable = 200;			//2ms
+
+	DischargeStopVolt = 0;
+
+	TestDischargeStart = 0;
+
+	CVModeRampEnable = 0;
+	CVModeRampPeriod = 0;
+	CVModeRampVal = 0;
+}
